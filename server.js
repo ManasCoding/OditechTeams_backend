@@ -335,7 +335,7 @@ app.get('/api/users/recent', async (req, res) => {
     const recentUsers = await User.find()
       .sort({ createdAt: -1 })
       .limit(5)
-      .select('fullName role department designation createdAt');
+      .select('fullName avatar role department designation createdAt');
 
     res.status(200).json({ success: true, users: recentUsers });
   } catch (error) {
