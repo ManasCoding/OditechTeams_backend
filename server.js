@@ -375,7 +375,16 @@ app.get('/api/calls', async (req, res) => {
 app.get('/api/channels', async (req, res) => {
   try {
     const channels = await Channel.find().populate('members', 'fullName email employeeCode avatar role isOnline lastSeen designation department');
-    res.status(200).json({ success: true, channels });
+    
+    // Fetch latest message for each channel
+    const channelsWithLatest = await Promise.all(channels.map(async (c) => {
+      const latestMsg = await Message.findOne({ channelId: c._id }).sort({ createdAt: -1 });
+      const channelObj = c.toObject();
+      channelObj.latestMessage = latestMsg;
+      return channelObj;
+    }));
+    
+    res.status(200).json({ success: true, channels: channelsWithLatest });
   } catch (error) {
     console.error('Get channels error:', error);
     res.status(500).json({ success: false, message: 'Server error fetching channels.' });
@@ -550,6 +559,14 @@ app.post('/api/meetings', async (req, res) => {
     return res.status(400).json({ success: false, message: 'hostId is required.' });
   }
   try {
+    // Verify the scheduling user is indeed an administrator
+    const User = require('./models/User');
+    const userObj = await User.findById(hostId);
+    const isAdminUser = userObj && ['admin', 'super_admin', 'Admin', 'Super Admin'].includes(userObj.role);
+    if (!isAdminUser) {
+      return res.status(403).json({ success: false, message: 'Unauthorized: Only administrators can schedule meetings.' });
+    }
+
     // Generate a unique 6-character alphanumeric meeting ID
     const generateMeetingId = () => Math.random().toString(36).substring(2, 8).toUpperCase();
     let meetingId;
@@ -628,8 +645,22 @@ app.get('/api/conversations', async (req, res) => {
     const conversations = await Conversation.find({ participants: userId })
       .populate('participants', 'fullName email avatar isOnline lastSeen')
       .populate('latestMessage');
-    res.status(200).json({ success: true, conversations });
+      
+    // Calculate unread count for each conversation
+    const conversationsWithUnread = await Promise.all(conversations.map(async (c) => {
+      const unreadCount = await Message.countDocuments({
+        conversationId: c._id,
+        senderId: { $ne: userId },
+        messageStatus: { $ne: 'seen' }
+      });
+      const convObj = c.toObject();
+      convObj.unreadCount = unreadCount;
+      return convObj;
+    }));
+
+    res.status(200).json({ success: true, conversations: conversationsWithUnread });
   } catch (err) {
+    console.error('Get conversations error:', err);
     res.status(500).json({ success: false, message: 'Server error fetching conversations.' });
   }
 });
