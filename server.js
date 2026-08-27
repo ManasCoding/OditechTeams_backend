@@ -403,13 +403,26 @@ app.post('/api/channels', async (req, res) => {
   }
 });
 
+// Get a single channel by ID with populated members
+app.get('/api/channels/:id', async (req, res) => {
+  try {
+    const channel = await Channel.findById(req.params.id)
+      .populate('members', 'fullName email employeeCode avatar role isOnline lastSeen designation department');
+    if (!channel) return res.status(404).json({ success: false, message: 'Channel not found' });
+    res.status(200).json({ success: true, channel });
+  } catch (error) {
+    console.error('Get single channel error:', error);
+    res.status(500).json({ success: false, message: 'Server error fetching channel' });
+  }
+});
+
 // Update a channel
 app.put('/api/channels/:id', authenticateUser, async (req, res) => {
   if (req.user.role !== 'admin' && req.user.role !== 'super_admin' && req.user.role !== 'Admin' && req.user.role !== 'Super Admin') {
     return res.status(403).json({ success: false, message: 'Unauthorized' });
   }
   
-  const { name, description, avatar } = req.body;
+  const { name, description, avatar, coverPhoto } = req.body;
   try {
     const channel = await Channel.findById(req.params.id);
     if (!channel) return res.status(404).json({ success: false, message: 'Channel not found' });
@@ -417,9 +430,12 @@ app.put('/api/channels/:id', authenticateUser, async (req, res) => {
     if (name) channel.name = name;
     if (description !== undefined) channel.description = description;
     if (avatar !== undefined) channel.avatar = avatar;
+    if (coverPhoto !== undefined) channel.coverPhoto = coverPhoto;
     
     await channel.save();
-    res.status(200).json({ success: true, message: 'Channel updated successfully', channel });
+    const populatedChannel = await Channel.findById(channel._id)
+      .populate('members', 'fullName email employeeCode avatar role isOnline lastSeen designation department');
+    res.status(200).json({ success: true, message: 'Channel updated successfully', channel: populatedChannel });
   } catch (error) {
     console.error('Update channel error:', error);
     res.status(500).json({ success: false, message: 'Server error updating channel' });
