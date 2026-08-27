@@ -580,7 +580,24 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
     return res.status(400).json({ success: false, message: 'No file uploaded.' });
   }
   try {
-    const fileUrl = `http://localhost:5000/uploads/${req.file.filename}`;
+    // Try Cloudinary upload if configured
+    if (process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET) {
+      try {
+        const cloudResult = await cloudinary.uploader.upload(req.file.path, {
+          folder: 'oditechteams'
+        });
+        if (fs.existsSync(req.file.path)) {
+          fs.unlinkSync(req.file.path);
+        }
+        return res.status(200).json({ success: true, fileUrl: cloudResult.secure_url });
+      } catch (cloudErr) {
+        console.error('Cloudinary upload failed, falling back to local storage:', cloudErr);
+      }
+    }
+    
+    // Fallback: local disk upload with dynamic base URL
+    const baseUrl = process.env.BASE_URL || `${req.protocol}://${req.get('host')}`;
+    const fileUrl = `${baseUrl}/uploads/${req.file.filename}`;
     res.status(200).json({ success: true, fileUrl });
   } catch (error) {
     console.error('Local upload error:', error);
