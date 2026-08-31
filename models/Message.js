@@ -57,6 +57,10 @@ const messageSchema = new mongoose.Schema({
   seenAt:      { type: Date, default: null },
   readAt:      { type: Date, default: null },
 
+  // ── Per-User Tracking (for Group Chats) ───────────────────
+  deliveredTo: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+  readBy:      [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+
   // ── Reply-to ──────────────────────────────────────────────
   replyTo: {
     type: mongoose.Schema.Types.ObjectId,

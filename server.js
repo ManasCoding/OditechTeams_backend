@@ -657,8 +657,10 @@ app.get('/api/conversations', async (req, res) => {
       const unreadCount = await Message.countDocuments({
         conversationId: c._id,
         senderId: { $ne: userId },
-        status: { $nin: ['seen', 'read'] },
-        messageStatus: { $ne: 'seen' }
+        $or: [
+          { readBy: { $exists: true, $not: { $size: 0 } }, readBy: { $ne: userId } },
+          { readBy: { $size: 0 }, status: { $nin: ['seen', 'read'] }, messageStatus: { $ne: 'seen' } }
+        ]
       });
       const convObj = c.toObject();
       convObj.unreadCount = unreadCount;
@@ -838,27 +840,38 @@ io.on('connection', async (socket) => {
     const undeliveredMessages = await Message.find({
       conversationId: { $in: userConvIds },
       senderId: { $ne: userId },
-      status: 'sent'
+      deliveredTo: { $ne: userId }
     });
 
     if (undeliveredMessages.length > 0) {
       const now = new Date();
       await Message.updateMany(
         { _id: { $in: undeliveredMessages.map(m => m._id) } },
-        { status: 'delivered', messageStatus: 'delivered', deliveredAt: now }
+        { $addToSet: { deliveredTo: userId } }
       );
 
-      // Group by conversation and notify senders
+      const updatedMessages = await Message.find({ _id: { $in: undeliveredMessages.map(m => m._id) } }).populate('conversationId');
       const convGroup = {};
       const senderGroup = {};
-      undeliveredMessages.forEach(m => {
-        const cId = m.conversationId.toString();
-        const sId = m.senderId.toString();
-        if (!convGroup[cId]) convGroup[cId] = [];
-        convGroup[cId].push(m._id);
-        if (!senderGroup[sId]) senderGroup[sId] = [];
-        senderGroup[sId].push(m._id);
-      });
+
+      for (const msg of updatedMessages) {
+        const cId = msg.conversationId?._id?.toString() || msg.conversationId?.toString();
+        if (!cId) continue;
+        const participantsCount = msg.conversationId.participants?.length || 2;
+        const expectedCount = participantsCount - 1;
+
+        if (msg.deliveredTo.length >= expectedCount && msg.status === 'sent') {
+          await Message.updateOne(
+            { _id: msg._id },
+            { status: 'delivered', messageStatus: 'delivered', deliveredAt: now }
+          );
+          const sId = msg.senderId.toString();
+          if (!convGroup[cId]) convGroup[cId] = [];
+          convGroup[cId].push(msg._id);
+          if (!senderGroup[sId]) senderGroup[sId] = [];
+          senderGroup[sId].push(msg._id);
+        }
+      }
 
       Object.entries(convGroup).forEach(([cId, msgIds]) => {
         io.to(cId).emit('message_delivered', { roomId: cId, messageIds: msgIds });
@@ -943,15 +956,37 @@ io.on('connection', async (socket) => {
       if (!messageIds || messageIds.length === 0) return;
       const now = new Date();
       await Message.updateMany(
-        { _id: { $in: messageIds }, status: 'sent' },
-        { status: 'delivered', messageStatus: 'delivered', deliveredAt: now }
+        { _id: { $in: messageIds } },
+        { $addToSet: { deliveredTo: userId } }
       );
+      
+      const updatedMessages = await Message.find({ _id: { $in: messageIds } }).populate('conversationId');
       const targetRoom = data.roomId || data.conversationId;
-      if (targetRoom) {
-        io.to(targetRoom).emit('message_delivered', { roomId: targetRoom, messageIds });
+      const senderIdsToNotify = new Set();
+      const messagesToNotify = [];
+
+      for (const msg of updatedMessages) {
+        if (!msg.conversationId) continue;
+        const participantsCount = msg.conversationId.participants?.length || 2;
+        const expectedCount = participantsCount - 1;
+
+        if (msg.deliveredTo.length >= expectedCount && msg.status === 'sent') {
+          await Message.updateOne(
+            { _id: msg._id },
+            { status: 'delivered', messageStatus: 'delivered', deliveredAt: now }
+          );
+          messagesToNotify.push(msg._id);
+          senderIdsToNotify.add(msg.senderId.toString());
+        }
       }
-      if (data.senderId) {
-        io.to(`user:${data.senderId.toString()}`).emit('message_delivered', { roomId: targetRoom, messageIds });
+
+      if (messagesToNotify.length > 0) {
+        if (targetRoom) {
+          io.to(targetRoom).emit('message_delivered', { roomId: targetRoom, messageIds: messagesToNotify });
+        }
+        senderIdsToNotify.forEach(sId => {
+          io.to(`user:${sId}`).emit('message_delivered', { roomId: targetRoom, messageIds: messagesToNotify });
+        });
       }
     } catch (err) {
       console.error('Error handling message_delivered:', err);
@@ -963,21 +998,50 @@ io.on('connection', async (socket) => {
       const roomId = data.roomId || data.conversationId;
       if (!roomId) return;
       const now = new Date();
+
+      const unreadMessages = await Message.find({
+        conversationId: roomId,
+        senderId: { $ne: userId },
+        readBy: { $ne: userId }
+      });
+      
+      if (unreadMessages.length === 0) return;
+      const msgIds = unreadMessages.map(m => m._id);
+
       await Message.updateMany(
-        { conversationId: roomId, senderId: { $ne: userId }, status: { $nin: ['seen', 'read'] } },
-        { status: 'seen', messageStatus: 'seen', seenAt: now, readAt: now }
+        { _id: { $in: msgIds } },
+        { $addToSet: { readBy: userId, deliveredTo: userId } }
       );
 
+      const updatedMessages = await Message.find({ _id: { $in: msgIds } }).populate('conversationId');
       const conv = await Conversation.findById(roomId);
-      const roomsToEmit = new Set([roomId.toString()]);
-      if (conv && conv.participants) {
-        conv.participants.forEach(p => roomsToEmit.add(`user:${p.toString()}`));
+      let globalSeenTriggered = false;
+
+      for (const msg of updatedMessages) {
+        if (!msg.conversationId) continue;
+        const participantsCount = msg.conversationId.participants?.length || 2;
+        const expectedCount = participantsCount - 1;
+
+        if (msg.readBy.length >= expectedCount && !['seen', 'read'].includes(msg.status)) {
+          await Message.updateOne(
+            { _id: msg._id },
+            { status: 'seen', messageStatus: 'seen', seenAt: now, readAt: now }
+          );
+          globalSeenTriggered = true;
+        }
       }
-      roomsToEmit.forEach(room => {
-        io.to(room).emit('message_seen', { roomId, userId });
-        io.to(room).emit('message_read', { roomId, userId });
-        io.to(room).emit('message:seen', { roomId, userId });
-      });
+
+      if (globalSeenTriggered) {
+        const roomsToEmit = new Set([roomId.toString()]);
+        if (conv && conv.participants) {
+          conv.participants.forEach(p => roomsToEmit.add(`user:${p.toString()}`));
+        }
+        roomsToEmit.forEach(room => {
+          io.to(room).emit('message_seen', { roomId, userId });
+          io.to(room).emit('message_read', { roomId, userId });
+          io.to(room).emit('message:seen', { roomId, userId });
+        });
+      }
     } catch (err) {
       console.error('Error handling message_seen:', err);
     }
