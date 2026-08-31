@@ -642,21 +642,35 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
 app.get('/api/conversations', async (req, res) => {
   try {
     const userId = req.query.userId;
+    if (!userId) return res.status(400).json({ success: false, message: 'userId required' });
+
     const conversations = await Conversation.find({ participants: userId })
-      .populate('participants', 'fullName email avatar isOnline lastSeen')
-      .populate('latestMessage');
+      .populate('participants', 'fullName email avatar isOnline lastSeen designation role')
+      .populate({
+        path: 'latestMessage',
+        populate: { path: 'senderId', select: 'fullName avatar' }
+      })
+      .sort({ updatedAt: -1 });
       
     // Calculate unread count for each conversation
     const conversationsWithUnread = await Promise.all(conversations.map(async (c) => {
       const unreadCount = await Message.countDocuments({
         conversationId: c._id,
         senderId: { $ne: userId },
+        status: { $nin: ['seen', 'read'] },
         messageStatus: { $ne: 'seen' }
       });
       const convObj = c.toObject();
       convObj.unreadCount = unreadCount;
       return convObj;
     }));
+
+    // Sort by latest message date or updatedAt descending
+    conversationsWithUnread.sort((a, b) => {
+      const dateA = new Date(a.latestMessage?.createdAt || a.updatedAt || 0).getTime();
+      const dateB = new Date(b.latestMessage?.createdAt || b.updatedAt || 0).getTime();
+      return dateB - dateA;
+    });
 
     res.status(200).json({ success: true, conversations: conversationsWithUnread });
   } catch (err) {
@@ -699,12 +713,98 @@ app.get('/api/conversations/:id/messages', async (req, res) => {
   try {
     const messages = await Message.find({ conversationId: req.params.id })
       .populate('senderId', 'fullName avatar')
+      .populate({
+        path: 'replyTo',
+        select: 'text senderId fileUrl fileType isDeleted',
+        populate: { path: 'senderId', select: 'fullName' }
+      })
       .sort({ createdAt: 1 });
     res.status(200).json({ success: true, messages });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error fetching messages.' });
   }
 });
+
+// Edit a message (sender only)
+app.put('/api/messages/:id', authenticateUser, async (req, res) => {
+  try {
+    const msg = await Message.findById(req.params.id);
+    if (!msg) return res.status(404).json({ success: false, message: 'Message not found' });
+    if (msg.senderId.toString() !== req.user.id) {
+      return res.status(403).json({ success: false, message: 'Not authorized' });
+    }
+    const { text } = req.body;
+    if (!text?.trim()) return res.status(400).json({ success: false, message: 'Text required' });
+    msg.text = text.trim();
+    msg.isEdited = true;
+    await msg.save();
+    const populated = await Message.findById(msg._id).populate('senderId', 'fullName avatar');
+    // Broadcast to conversation room
+    const roomId = msg.conversationId?.toString() || msg.channelId?.toString();
+    if (roomId) io.to(roomId).emit('message_edited', populated);
+    res.status(200).json({ success: true, message: populated });
+  } catch (err) {
+    console.error('Edit message error:', err);
+    res.status(500).json({ success: false, message: 'Server error editing message' });
+  }
+});
+
+// Delete a message (sender only — marks as deleted)
+app.delete('/api/messages/:id', authenticateUser, async (req, res) => {
+  try {
+    const msg = await Message.findById(req.params.id);
+    if (!msg) return res.status(404).json({ success: false, message: 'Message not found' });
+    if (msg.senderId.toString() !== req.user.id && req.user.role !== 'admin' && req.user.role !== 'super_admin') {
+      return res.status(403).json({ success: false, message: 'Not authorized' });
+    }
+    msg.isDeleted = true;
+    msg.text = '';
+    msg.fileUrl = '';
+    await msg.save();
+    const roomId = msg.conversationId?.toString() || msg.channelId?.toString();
+    if (roomId) io.to(roomId).emit('message_deleted', { _id: msg._id, conversationId: msg.conversationId });
+    res.status(200).json({ success: true });
+  } catch (err) {
+    console.error('Delete message error:', err);
+    res.status(500).json({ success: false, message: 'Server error deleting message' });
+  }
+});
+
+// Toggle reaction on a message
+app.post('/api/messages/:id/react', authenticateUser, async (req, res) => {
+  try {
+    const msg = await Message.findById(req.params.id);
+    if (!msg) return res.status(404).json({ success: false, message: 'Message not found' });
+    const { emoji } = req.body;
+    if (!emoji) return res.status(400).json({ success: false, message: 'Emoji required' });
+    const userId = req.user.id;
+
+    let reactionEntry = msg.reactions.find(r => r.emoji === emoji);
+    if (reactionEntry) {
+      const idx = reactionEntry.users.map(u => u.toString()).indexOf(userId);
+      if (idx > -1) {
+        reactionEntry.users.splice(idx, 1); // un-react
+        if (reactionEntry.users.length === 0) {
+          msg.reactions = msg.reactions.filter(r => r.emoji !== emoji);
+        }
+      } else {
+        reactionEntry.users.push(userId); // react
+      }
+    } else {
+      msg.reactions.push({ emoji, users: [userId] });
+    }
+
+    await msg.save();
+    const populated = await Message.findById(msg._id).populate('senderId', 'fullName avatar');
+    const roomId = msg.conversationId?.toString() || msg.channelId?.toString();
+    if (roomId) io.to(roomId).emit('message_reaction', { _id: msg._id, reactions: msg.reactions });
+    res.status(200).json({ success: true, reactions: msg.reactions });
+  } catch (err) {
+    console.error('React message error:', err);
+    res.status(500).json({ success: false, message: 'Server error reacting to message' });
+  }
+});
+
 
 // Socket.IO Setup
 io.use((socket, next) => {
@@ -724,12 +824,55 @@ io.on('connection', async (socket) => {
   // Register socket for this user
   connectedUsers[userId] = socket.id;
 
+  // Join user's personal room for direct notification and message delivery
+  socket.join(`user:${userId}`);
+
   // Set user online
   await User.findByIdAndUpdate(userId, { isOnline: true });
   io.emit('user_online', userId);
 
+  // ─── Offline Reconnection Sync: Deliver any pending sent messages to this user ───
+  try {
+    const userConvs = await Conversation.find({ participants: userId });
+    const userConvIds = userConvs.map(c => c._id);
+    const undeliveredMessages = await Message.find({
+      conversationId: { $in: userConvIds },
+      senderId: { $ne: userId },
+      status: 'sent'
+    });
+
+    if (undeliveredMessages.length > 0) {
+      const now = new Date();
+      await Message.updateMany(
+        { _id: { $in: undeliveredMessages.map(m => m._id) } },
+        { status: 'delivered', messageStatus: 'delivered', deliveredAt: now }
+      );
+
+      // Group by conversation and notify senders
+      const convGroup = {};
+      const senderGroup = {};
+      undeliveredMessages.forEach(m => {
+        const cId = m.conversationId.toString();
+        const sId = m.senderId.toString();
+        if (!convGroup[cId]) convGroup[cId] = [];
+        convGroup[cId].push(m._id);
+        if (!senderGroup[sId]) senderGroup[sId] = [];
+        senderGroup[sId].push(m._id);
+      });
+
+      Object.entries(convGroup).forEach(([cId, msgIds]) => {
+        io.to(cId).emit('message_delivered', { roomId: cId, messageIds: msgIds });
+      });
+      Object.entries(senderGroup).forEach(([sId, msgIds]) => {
+        io.to(`user:${sId}`).emit('message_delivered', { messageIds: msgIds });
+      });
+    }
+  } catch (err) {
+    console.error('Offline delivery sync error on connect:', err);
+  }
+
   // ─── Chat Events ───────────────────────────────────────────
-  socket.on('join_room', (roomId) => {
+  socket.on('join_room', async (roomId) => {
     socket.join(roomId);
   });
 
@@ -747,33 +890,99 @@ io.on('connection', async (socket) => {
 
   socket.on('send_message', async (data) => {
     try {
+      const conv = await Conversation.findById(data.roomId);
+      let receiverId = null;
+      if (conv && !conv.isGroup && conv.participants && conv.participants.length === 2) {
+        receiverId = conv.participants.find(p => p.toString() !== userId.toString());
+      }
+
       const newMsg = new Message({
         conversationId: data.roomId,
         senderId: userId,
-        text: data.text,
-        fileUrl: data.fileUrl,
-        messageStatus: 'sent'
+        receiverId: receiverId || null,
+        text: data.text || '',
+        fileUrl:  data.fileUrl  || '',
+        fileType: data.fileType || 'text',
+        fileName: data.fileName || '',
+        fileSize: data.fileSize || 0,
+        replyTo:  data.replyTo  || null,
+        status: 'sent',
+        messageStatus: 'sent',
+        sentAt: new Date(),
+        clientMessageId: data.clientMessageId || ''
       });
       await newMsg.save();
-      const populatedMsg = await Message.findById(newMsg._id).populate('senderId', 'fullName avatar');
+
+      const populatedMsg = await Message.findById(newMsg._id)
+        .populate('senderId', 'fullName avatar')
+        .populate({
+          path: 'replyTo',
+          select: 'text senderId fileUrl fileType isDeleted',
+          populate: { path: 'senderId', select: 'fullName' }
+        });
+
       await Conversation.findByIdAndUpdate(data.roomId, { latestMessage: newMsg._id });
-      io.to(data.roomId).emit('receive_message', populatedMsg);
+
+      // Emit to conversation room AND all participant user rooms so everyone gets realtime notification
+      const roomsToEmit = new Set([data.roomId.toString()]);
+      if (conv && conv.participants) {
+        conv.participants.forEach(p => roomsToEmit.add(`user:${p.toString()}`));
+      }
+      roomsToEmit.forEach(room => {
+        io.to(room).emit('receive_message', populatedMsg);
+        io.to(room).emit('message:new', populatedMsg);
+      });
     } catch (err) {
       console.error('Error sending message via socket:', err);
     }
   });
 
-  socket.on('message_seen', async (data) => {
+  socket.on('message_delivered', async (data) => {
     try {
+      const messageIds = Array.isArray(data.messageIds) ? data.messageIds : (data.messageId ? [data.messageId] : []);
+      if (!messageIds || messageIds.length === 0) return;
+      const now = new Date();
       await Message.updateMany(
-        { conversationId: data.roomId, senderId: { $ne: userId }, messageStatus: { $ne: 'seen' } },
-        { messageStatus: 'seen' }
+        { _id: { $in: messageIds }, status: 'sent' },
+        { status: 'delivered', messageStatus: 'delivered', deliveredAt: now }
       );
-      io.to(data.roomId).emit('message_seen', { roomId: data.roomId, userId });
+      const targetRoom = data.roomId || data.conversationId;
+      if (targetRoom) {
+        io.to(targetRoom).emit('message_delivered', { roomId: targetRoom, messageIds });
+      }
+      if (data.senderId) {
+        io.to(`user:${data.senderId.toString()}`).emit('message_delivered', { roomId: targetRoom, messageIds });
+      }
     } catch (err) {
-      console.error(err);
+      console.error('Error handling message_delivered:', err);
     }
   });
+
+  socket.on('message_seen', async (data) => {
+    try {
+      const roomId = data.roomId || data.conversationId;
+      if (!roomId) return;
+      const now = new Date();
+      await Message.updateMany(
+        { conversationId: roomId, senderId: { $ne: userId }, status: { $nin: ['seen', 'read'] } },
+        { status: 'seen', messageStatus: 'seen', seenAt: now, readAt: now }
+      );
+
+      const conv = await Conversation.findById(roomId);
+      const roomsToEmit = new Set([roomId.toString()]);
+      if (conv && conv.participants) {
+        conv.participants.forEach(p => roomsToEmit.add(`user:${p.toString()}`));
+      }
+      roomsToEmit.forEach(room => {
+        io.to(room).emit('message_seen', { roomId, userId });
+        io.to(room).emit('message_read', { roomId, userId });
+        io.to(room).emit('message:seen', { roomId, userId });
+      });
+    } catch (err) {
+      console.error('Error handling message_seen:', err);
+    }
+  });
+
 
   // ─── WebRTC Calling Signaling ──────────────────────────────
 
