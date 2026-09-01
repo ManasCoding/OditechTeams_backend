@@ -511,18 +511,22 @@ app.get('/api/channels/:id/messages', async (req, res) => {
 
 // Post a message to a channel
 app.post('/api/channels/:id/messages', async (req, res) => {
-  const { text, author, authorInitials, authorAvatar, senderId } = req.body;
-  if (!text || !text.trim()) {
-    return res.status(400).json({ success: false, message: 'Message text is required.' });
+  const { text, author, authorInitials, authorAvatar, senderId, fileUrl, fileName, fileSize, fileType } = req.body;
+  if ((!text || !text.trim()) && !fileUrl) {
+    return res.status(400).json({ success: false, message: 'Message text or file is required.' });
   }
   try {
     const newMsg = new Message({
       channelId: req.params.id,
-      text: text.trim(),
+      text: (text || '').trim(),
       author: author || 'Unknown',
       authorInitials: authorInitials || '??',
       authorAvatar: authorAvatar || '',
-      senderId: senderId || null
+      senderId: senderId || null,
+      fileUrl: fileUrl || '',
+      fileName: fileName || '',
+      fileSize: fileSize || 0,
+      fileType: fileType || (fileUrl ? 'file' : 'text')
     });
     await newMsg.save();
     
