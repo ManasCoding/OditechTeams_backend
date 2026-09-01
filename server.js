@@ -661,10 +661,9 @@ app.get('/api/conversations', async (req, res) => {
       const unreadCount = await Message.countDocuments({
         conversationId: c._id,
         senderId: { $ne: userId },
-        $or: [
-          { readBy: { $exists: true, $not: { $size: 0 } }, readBy: { $ne: userId } },
-          { readBy: { $size: 0 }, status: { $nin: ['seen', 'read'] }, messageStatus: { $ne: 'seen' } }
-        ]
+        readBy: { $ne: userId },
+        status: { $nin: ['seen', 'read'] },
+        messageStatus: { $ne: 'seen' }
       });
       const convObj = c.toObject();
       convObj.unreadCount = unreadCount;
