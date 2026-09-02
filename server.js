@@ -8,6 +8,8 @@ const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const fileRoutes = require('./routes/fileRoutes');
+const adminFileRoutes = require('./routes/adminFileRoutes');
 
 const app = express();
 const server = http.createServer(app);
@@ -52,6 +54,12 @@ if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir);
 }
 
+// Ensure logs directory exists
+const logsDir = path.join(__dirname, 'logs');
+if (!fs.existsSync(logsDir)) {
+  fs.mkdirSync(logsDir);
+}
+
 // Multer Storage Configuration
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -64,7 +72,7 @@ const storage = multer.diskStorage({
 const upload = multer({ storage });
 
 // Database connection
-mongoose.connect(process.env.MONGO_URI)
+mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/oditechteams')
   .then(() => console.log('MongoDB connected successfully'))
   .catch(err => console.error('MongoDB connection error:', err));
 
@@ -218,6 +226,18 @@ const authenticateUser = (req, res, next) => {
     return res.status(401).json({ success: false, message: 'Invalid token' });
   }
 };
+
+const requireAdmin = (req, res, next) => {
+  if (req.user && ['admin', 'super_admin', 'Admin', 'Super Admin'].includes(req.user.role)) {
+    next();
+  } else {
+    return res.status(403).json({ success: false, message: 'Admin access required.' });
+  }
+};
+
+// File Routes
+app.use('/api/files', authenticateUser, fileRoutes);
+app.use('/api/admin/files', authenticateUser, requireAdmin, adminFileRoutes);
 
 // Profile Route - GET
 app.get('/api/profile', authenticateUser, async (req, res) => {
