@@ -21,8 +21,8 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173')
 
 const corsOptions = {
   origin: (origin, callback) => {
-    // Allow requests with no origin (e.g. mobile apps, curl, Postman)
-    if (!origin || allowedOrigins.includes(origin)) {
+    // Allow requests with no origin, or if origin matches allowed list, or if it's any localhost port
+    if (!origin || allowedOrigins.includes(origin) || /^https?:\/\/localhost(:\d+)?$/.test(origin)) {
       callback(null, true);
     } else {
       callback(new Error(`CORS blocked: ${origin}`));
@@ -35,7 +35,13 @@ const corsOptions = {
 
 const io = new Server(server, {
   cors: {
-    origin: allowedOrigins,
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin) || /^https?:\/\/localhost(:\d+)?$/.test(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error(`CORS blocked: ${origin}`));
+      }
+    },
     methods: ['GET', 'POST'],
     credentials: true,
   }
