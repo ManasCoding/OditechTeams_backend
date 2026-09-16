@@ -15,7 +15,7 @@ const app = express();
 const server = http.createServer(app);
 
 // ── CORS Origins from .env ────────────────────────────────────
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173,https://oditech-teams-frontend.vercel.app')
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173,https://oditech-teams-frontend.vercel.app,https://oditech-teams-frontend-theta.vercel.app/')
   .split(',')
   .map(o => o.trim());
 
